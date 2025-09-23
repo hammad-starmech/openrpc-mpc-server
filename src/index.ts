@@ -93,18 +93,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "rpc_call": {
       const server = String(request.params.arguments?.server);
       const method = String(request.params.arguments?.method);
-      const params = JSON.parse(String(request.params.arguments?.params));
+      const paramsRaw = request.params.arguments?.params;
+      const params = paramsRaw != null ? JSON.parse(String(paramsRaw)) : undefined;
       let transport = new HTTPTransport(server);
       let client = new Client(new RequestManager([transport]));
       const results = await client.request({ method: method, params: params as any});
       return {
-        toolResult: {
-          content: [{
-            type: "text",
-            text: JSON.stringify(results, null, 2)
-          }],
-          isError: false
-        }
+        content: [
+          { type: "text", text: JSON.stringify(results, null, 2) }
+        ],
+        isError: false
       };
     }
     case "rpc_discover": {
@@ -115,15 +113,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       let transport = new HTTPTransport(server);
       let client = new Client(new RequestManager([transport]));
       const results = await client.request({ method: "rpc.discover" });
-
-      return  {
-        toolResult: {
-          content: [{
-            type: "text",
-            text: JSON.stringify(results, null, 2)
-          }],
-          isError: false
-        }
+      
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(results, null, 2) }
+        ],
+        isError: false
       };
     }
 
