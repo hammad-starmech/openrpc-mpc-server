@@ -1,12 +1,28 @@
 {
-  "name": "openrpc-mcp-server",
-  "version": "0.1.2",
-  "description": "OpenRPC MCP server",
+  "name": "openrpc-mcp-server-updated",
+  "version": "0.2.0",
+  "description": "OpenRPC MCP server - Updated with latest @modelcontextprotocol/sdk for compatibility with newer clients",
   "main": "./build/index.js",
   "type": "module",
   "bin": {
     "openrpc-mcp-server": "./build/index.js"
   },
+  "author": "hammad_ignite",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hammad-starmech/openrpc-mpc-server"
+  },
+  "homepage": "https://github.com/hammad-starmech/openrpc-mpc-server#readme",
+  "bugs": {
+    "url": "https://github.com/hammad-starmech/openrpc-mpc-server/issues"
+  },
+  "keywords": [
+    "mcp",
+    "openrpc",
+    "json-rpc",
+    "model-context-protocol"
+  ],
+  "license": "Apache-2.0",
   "files": [
     "build"
   ],
