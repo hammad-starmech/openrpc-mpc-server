@@ -4,6 +4,7 @@ import $RefParser from "@apidevtools/json-schema-ref-parser";
 import { readFileSync } from "fs";
 import { resolve } from "path";
 import fetch from "isomorphic-fetch";
+import https from "https";
 
 /**
  * This is an OpenRPC server that loads an OpenRPC spec file and provides
@@ -24,6 +25,11 @@ import {
 let openRpcSpec: any = null;
 let kerioCredentials: { username: string; password: string } | null = null;
 let kerioSession: { sessionCookie: string; tokenCookie: string } | null = null;
+
+// Create an HTTPS agent that ignores certificate errors (like curl -k)
+const httpsAgent = new https.Agent({
+  rejectUnauthorized: false
+});
 
 /**
  * Load and dereference the OpenRPC specification from a file path
@@ -88,7 +94,13 @@ async function authenticateKerio(): Promise<void> {
   }
 
   const serverUrl = getServerUrl();
-  const loginUrl = `${serverUrl}/admin/internal/dologin.php?hash=dashboard`;
+  // Extract base URL without JSON-RPC path if present
+  let baseUrl = serverUrl;
+  if (serverUrl.includes('/admin/api/jsonrpc')) {
+    // Remove the JSON-RPC path to get the base URL
+    baseUrl = serverUrl.substring(0, serverUrl.indexOf('/admin/api/jsonrpc'));
+  }
+  const loginUrl = `${baseUrl}/admin/internal/dologin.php?hash=dashboard`;
 
   // Prepare form data for login
   const formData = new URLSearchParams();
@@ -103,8 +115,9 @@ async function authenticateKerio(): Promise<void> {
         'User-Agent': 'OpenRPC-MCP-Server'
       },
       body: formData.toString(),
-      redirect: 'manual' // Handle redirects manually to capture cookies
-    });
+      redirect: 'manual', // Handle redirects manually to capture cookies
+      agent: loginUrl.startsWith('https') ? httpsAgent : undefined
+    } as any);
 
     // Extract cookies from Set-Cookie headers
     const setCookieHeaders: string[] = [];
@@ -335,11 +348,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!serverUrl.includes('/admin/api/jsonrpc')) {
           jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
         }
-        transport = new HTTPTransport(jsonRpcUrl, { headers });
+        const fetchOptions: any = { 
+          headers,
+          agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
+        };
+        transport = new HTTPTransport(jsonRpcUrl, fetchOptions);
         client = new Client(new RequestManager([transport]));
       } else {
         // No authentication needed - use original implementation
-        transport = new HTTPTransport(serverUrl);
+        const fetchOptions: any = serverUrl.startsWith('https') ? { agent: httpsAgent } : {};
+        transport = new HTTPTransport(serverUrl, fetchOptions);
         client = new Client(new RequestManager([transport]));
       }
 
@@ -382,7 +400,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!serverUrl.includes('/admin/api/jsonrpc')) {
               jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
             }
-            const retryTransport = new HTTPTransport(jsonRpcUrl, { headers: retryHeaders });
+            const retryFetchOptions: any = {
+              headers: retryHeaders,
+              agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
+            };
+            const retryTransport = new HTTPTransport(jsonRpcUrl, retryFetchOptions);
             const retryClient = new Client(new RequestManager([retryTransport]));
 
             const retryResults = await retryClient.request({ method: methodName, params: params as any });
