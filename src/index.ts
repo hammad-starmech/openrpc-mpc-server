@@ -183,23 +183,11 @@ async function authenticateKerio(): Promise<void> {
 
     console.error(`Auth response status: ${response.statusCode}`);
     
-    // Debug: Show all headers in different formats
-    console.error("=== Headers Debug ===");
-    console.error("Standard headers object:", JSON.stringify(response.headers, null, 2));
-    
-    if (response.rawHeaders) {
-      console.error("Raw headers array (pairs):");
-      for (let i = 0; i < response.rawHeaders.length; i += 2) {
-        console.error(`  ${response.rawHeaders[i]}: ${response.rawHeaders[i + 1]}`);
-      }
-    }
-    
     // Extract cookies from Set-Cookie headers using multiple methods
     const setCookieHeaders: string[] = [];
     
     // Method 1: Try standard headers object
     if (response.headers && response.headers['set-cookie']) {
-      console.error("Found cookies in headers['set-cookie']");
       setCookieHeaders.push(...(Array.isArray(response.headers['set-cookie']) 
         ? response.headers['set-cookie'] 
         : [response.headers['set-cookie']]));
@@ -209,7 +197,6 @@ async function authenticateKerio(): Promise<void> {
     if (setCookieHeaders.length === 0 && response.rawHeaders) {
       for (let i = 0; i < response.rawHeaders.length; i += 2) {
         if (response.rawHeaders[i].toLowerCase() === 'set-cookie') {
-          console.error(`Found cookie in rawHeaders at index ${i}: ${response.rawHeaders[i + 1]}`);
           setCookieHeaders.push(response.rawHeaders[i + 1]);
         }
       }
@@ -218,21 +205,11 @@ async function authenticateKerio(): Promise<void> {
     // Method 3: Try headersDistinct (Node.js 18+)
     if (setCookieHeaders.length === 0 && response.headersDistinct) {
       if (response.headersDistinct['set-cookie']) {
-        console.error("Found cookies in headersDistinct");
         setCookieHeaders.push(...response.headersDistinct['set-cookie']);
       }
     }
     
-    console.error(`=== Total Set-Cookie headers found: ${setCookieHeaders.length} ===`);
-    if (setCookieHeaders.length > 0) {
-      console.error("Set-Cookie values:", setCookieHeaders);
-    } else {
-      console.error("NO SET-COOKIE HEADERS FOUND!");
-      console.error("Response body snippet:", response.data ? response.data.substring(0, 200) : "empty");
-    }
-    
     const cookies = parseSetCookies(setCookieHeaders);
-    console.error("Parsed cookies:", Object.keys(cookies));
 
     if (cookies.SESSION_CONTROL_WEBADMIN && cookies.TOKEN_CONTROL_WEBADMIN) {
       kerioSession = {
@@ -240,8 +217,6 @@ async function authenticateKerio(): Promise<void> {
         tokenCookie: cookies.TOKEN_CONTROL_WEBADMIN
       };
       console.error("Kerio authentication successful");
-      console.error(`Session cookie: ${kerioSession.sessionCookie.substring(0, 10)}...`);
-      console.error(`Token cookie: ${kerioSession.tokenCookie.substring(0, 10)}...`);
     } else {
       console.error("Required cookies not found. Available cookies:", cookies);
       throw new Error("Authentication failed - required cookies not received");
@@ -457,16 +432,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!serverUrl.includes('/admin/api/jsonrpc')) {
           jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
         }
-        const fetchOptions: any = { 
+        
+        // Configure fetch options with HTTPS agent to ignore certificate errors
+        const transportOptions: any = { 
           headers,
           agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
         };
-        transport = new HTTPTransport(jsonRpcUrl, fetchOptions);
+        transport = new HTTPTransport(jsonRpcUrl, transportOptions);
         client = new Client(new RequestManager([transport]));
       } else {
         // No authentication needed - use original implementation
-        const fetchOptions: any = serverUrl.startsWith('https') ? { agent: httpsAgent } : {};
-        transport = new HTTPTransport(serverUrl, fetchOptions);
+        const transportOptions: any = serverUrl.startsWith('https') ? { agent: httpsAgent } : {};
+        transport = new HTTPTransport(serverUrl, transportOptions);
         client = new Client(new RequestManager([transport]));
       }
 
@@ -509,11 +486,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!serverUrl.includes('/admin/api/jsonrpc')) {
               jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
             }
-            const retryFetchOptions: any = {
+            const retryTransportOptions: any = {
               headers: retryHeaders,
               agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
             };
-            const retryTransport = new HTTPTransport(jsonRpcUrl, retryFetchOptions);
+            const retryTransport = new HTTPTransport(jsonRpcUrl, retryTransportOptions);
             const retryClient = new Client(new RequestManager([retryTransport]));
 
             const retryResults = await retryClient.request({ method: methodName, params: params as any });
@@ -571,6 +548,11 @@ async function main() {
       password: args[2]
     };
     console.error(`Kerio authentication enabled for user: ${kerioCredentials.username}`);
+    
+    // Disable certificate verification globally for HTTPS requests (needed for self-signed certs)
+    // This is a fallback in case the agent approach doesn't work with HTTPTransport
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+    console.error("Certificate verification disabled for Kerio Control");
   }
 
   // Load and parse the OpenRPC spec
