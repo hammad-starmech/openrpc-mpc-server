@@ -34,10 +34,12 @@
     "inspector": "npx @modelcontextprotocol/inspector build/index.js"
   },
   "dependencies": {
+    "@apidevtools/json-schema-ref-parser": "^14.2.1",
     "@modelcontextprotocol/sdk": "1.18.1",
     "@open-rpc/client-js": "^1.8.1"
   },
   "devDependencies": {
+    "@types/isomorphic-fetch": "^0.0.39",
     "@types/node": "^20.11.24",
     "typescript": "^5.3.3"
   }
