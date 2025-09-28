@@ -284,7 +284,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "rpc_call",
-        description: "Call a JSON-RPC method using the loaded OpenRPC spec. Parameters should be provided as a JSON object.",
+        description: "Call a JSON-RPC method using the loaded OpenRPC spec. Parameters should be provided as a JSON object. Important: For any Create, Update, or Delete operations, use the Batch.run method. Inside Batch.run, include Session.getconfigTimestamp as the final method which will return a timestamp. After receiving the timestamp, verify the changes using Session.Confirm, passing the timestamp as clientTimestampList.",
         inputSchema: {
           type: "object",
           properties: {
