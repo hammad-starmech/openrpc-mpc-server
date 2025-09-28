@@ -3,6 +3,7 @@ import { RequestManager, HTTPTransport, Client } from "@open-rpc/client-js";
 import $RefParser from "@apidevtools/json-schema-ref-parser";
 import { readFileSync } from "fs";
 import { resolve } from "path";
+import fetch from "isomorphic-fetch";
 
 /**
  * This is an OpenRPC server that loads an OpenRPC spec file and provides
@@ -19,8 +20,10 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-// Global variable to store the loaded and dereferenced OpenRPC spec
+// Global variables to store the loaded and dereferenced OpenRPC spec and auth data
 let openRpcSpec: any = null;
+let kerioCredentials: { username: string; password: string } | null = null;
+let kerioSession: { sessionCookie: string; tokenCookie: string } | null = null;
 
 /**
  * Load and dereference the OpenRPC specification from a file path
@@ -48,6 +51,84 @@ function getServerUrl(): string {
     throw new Error("No servers defined in OpenRPC spec");
   }
   return openRpcSpec.servers[0].url;
+}
+
+/**
+ * Parse Set-Cookie headers from response
+ */
+function parseSetCookies(setCookieHeaders: string[]): { [key: string]: string } {
+  const cookies: { [key: string]: string } = {};
+
+  setCookieHeaders.forEach(cookieHeader => {
+    const [cookiePart] = cookieHeader.split(';');
+    const [name, value] = cookiePart.split('=');
+    if (name && value) {
+      cookies[name.trim()] = value.trim();
+    }
+  });
+
+  return cookies;
+}
+
+/**
+ * Build cookie header string from cookie object
+ */
+function buildCookieHeader(cookies: { [key: string]: string }): string {
+  return Object.entries(cookies)
+    .map(([name, value]) => `${name}=${value}`)
+    .join('; ');
+}
+
+/**
+ * Authenticate with Kerio Control and store session cookies
+ */
+async function authenticateKerio(): Promise<void> {
+  if (!kerioCredentials) {
+    throw new Error("Kerio credentials not provided");
+  }
+
+  const serverUrl = getServerUrl();
+  const loginUrl = `${serverUrl}/admin/internal/dologin.php?hash=dashboard`;
+
+  // Prepare form data for login
+  const formData = new URLSearchParams();
+  formData.append('kerio_username', kerioCredentials.username);
+  formData.append('kerio_password', kerioCredentials.password);
+
+  try {
+    const response = await fetch(loginUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'OpenRPC-MCP-Server'
+      },
+      body: formData.toString(),
+      redirect: 'manual' // Handle redirects manually to capture cookies
+    });
+
+    // Extract cookies from Set-Cookie headers
+    const setCookieHeaders: string[] = [];
+    response.headers.forEach((value, name) => {
+      if (name.toLowerCase() === 'set-cookie') {
+        setCookieHeaders.push(value);
+      }
+    });
+    const cookies = parseSetCookies(setCookieHeaders);
+
+    if (cookies.SESSION_CONTROL_WEBADMIN && cookies.TOKEN_CONTROL_WEBADMIN) {
+      kerioSession = {
+        sessionCookie: cookies.SESSION_CONTROL_WEBADMIN,
+        tokenCookie: cookies.TOKEN_CONTROL_WEBADMIN
+      };
+      console.error("Kerio authentication successful");
+    } else {
+      throw new Error("Authentication failed - required cookies not received");
+    }
+
+  } catch (error) {
+    console.error("Kerio authentication failed:", error);
+    throw new Error(`Failed to authenticate with Kerio Control: ${error}`);
+  }
 }
 
 /**
@@ -196,13 +277,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Method '${methodName}' not found in OpenRPC spec`);
       }
 
+      // Authenticate if Kerio credentials are provided and we don't have a session
+      if (kerioCredentials && !kerioSession) {
+        await authenticateKerio();
+      }
+
       // Make the actual JSON-RPC call
       const serverUrl = getServerUrl();
-      const transport = new HTTPTransport(serverUrl);
-      const client = new Client(new RequestManager([transport]));
+
+      // Prepare transport and client based on whether we have Kerio session
+      let transport: HTTPTransport;
+      let client: Client;
+      let results: any;
+
+      if (kerioSession) {
+        // Authenticated request to Kerio Control
+        const cookieHeader = buildCookieHeader({
+          'SESSION_CONTROL_WEBADMIN': kerioSession.sessionCookie,
+          'TOKEN_CONTROL_WEBADMIN': kerioSession.tokenCookie
+        });
+
+        const headers: Record<string, string> = {
+          'Cookie': cookieHeader,
+          'X-Token': kerioSession.tokenCookie,
+          'Accept': 'application/json-rpc',
+          'X-Requested-With': 'XMLHttpRequest'
+        };
+
+        // Use the server URL as-is - it should already point to the JSON-RPC endpoint
+        // If it doesn't contain the JSON-RPC path, append it
+        let jsonRpcUrl = serverUrl;
+        if (!serverUrl.includes('/admin/api/jsonrpc')) {
+          jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
+        }
+        transport = new HTTPTransport(jsonRpcUrl, { headers });
+        client = new Client(new RequestManager([transport]));
+      } else {
+        // No authentication needed - use original implementation
+        transport = new HTTPTransport(serverUrl);
+        client = new Client(new RequestManager([transport]));
+      }
 
       try {
-        const results = await client.request({ method: methodName, params: params as any });
+        results = await client.request({ method: methodName, params: params as any });
         return {
           content: [
             { type: "text", text: JSON.stringify(results, null, 2) }
@@ -210,6 +327,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           isError: false
         };
       } catch (error) {
+        // If we have Kerio credentials and the error might be auth-related, try re-authenticating
+        if (kerioCredentials && kerioSession && (
+          error?.toString().includes('401') ||
+          error?.toString().includes('403') ||
+          error?.toString().includes('Unauthorized') ||
+          error?.toString().includes('Forbidden')
+        )) {
+          console.error("Authentication may have expired, attempting to re-authenticate...");
+
+          try {
+            // Clear the existing session and re-authenticate
+            kerioSession = null;
+            await authenticateKerio();
+
+            // Retry the request with fresh authentication
+            const retryHeaders: Record<string, string> = {
+              'Cookie': buildCookieHeader({
+                'SESSION_CONTROL_WEBADMIN': kerioSession!.sessionCookie,
+                'TOKEN_CONTROL_WEBADMIN': kerioSession!.tokenCookie
+              }),
+              'X-Token': kerioSession!.tokenCookie,
+              'Accept': 'application/json-rpc',
+              'X-Requested-With': 'XMLHttpRequest'
+            };
+
+            // Use the server URL as-is - it should already point to the JSON-RPC endpoint
+            let jsonRpcUrl = serverUrl;
+            if (!serverUrl.includes('/admin/api/jsonrpc')) {
+              jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
+            }
+            const retryTransport = new HTTPTransport(jsonRpcUrl, { headers: retryHeaders });
+            const retryClient = new Client(new RequestManager([retryTransport]));
+
+            const retryResults = await retryClient.request({ method: methodName, params: params as any });
+            return {
+              content: [
+                { type: "text", text: JSON.stringify(retryResults, null, 2) }
+              ],
+              isError: false
+            };
+          } catch (retryError) {
+            return {
+              content: [
+                { type: "text", text: `Error calling method '${methodName}' after re-authentication: ${retryError}` }
+              ],
+              isError: true
+            };
+          }
+        }
+
         return {
           content: [
             { type: "text", text: `Error calling method '${methodName}': ${error}` }
@@ -230,15 +397,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
  * First loads the OpenRPC spec from the command line argument.
  */
 async function main() {
-  // Get the OpenRPC spec file path from command line arguments
+  // Get the OpenRPC spec file path and optional credentials from command line arguments
   const args = process.argv.slice(2);
   if (args.length === 0) {
-    console.error("Usage: openrpc-mcp-server <path-to-openrpc-spec.json>");
-    console.error("Example: openrpc-mcp-server ./my-api-spec.json");
+    console.error("Usage: openrpc-mcp-server <path-to-openrpc-spec.json> [kerio_username] [kerio_password]");
+    console.error("Example: openrpc-mcp-server ./my-api-spec.json admin mypassword");
+    console.error("Note: If username and password are provided, the server will authenticate with Kerio Control");
     process.exit(1);
   }
 
   const specPath = args[0];
+
+  // Store Kerio credentials if provided
+  if (args.length >= 3) {
+    kerioCredentials = {
+      username: args[1],
+      password: args[2]
+    };
+    console.error(`Kerio authentication enabled for user: ${kerioCredentials.username}`);
+  }
 
   // Load and parse the OpenRPC spec
   await loadOpenRpcSpec(specPath);
