@@ -108,9 +108,16 @@ function makeHttpsRequest(url: string, options: any, postData?: string): Promise
       });
       
       res.on('end', () => {
+        // Try multiple ways to get headers to ensure we capture Set-Cookie
+        const headers = res.headers;
+        const rawHeaders = res.rawHeaders;
+        const headersDistinct = (res as any).headersDistinct;
+        
         resolve({
           statusCode: res.statusCode,
-          headers: res.headers,
+          headers: headers,
+          rawHeaders: rawHeaders,
+          headersDistinct: headersDistinct,
           data
         });
       });
@@ -153,29 +160,75 @@ async function authenticateKerio(): Promise<void> {
   try {
     console.error(`Authenticating with Kerio at: ${loginUrl}`);
     
-    // Use native HTTPS module for better cookie handling
+    // Use browser-like headers to ensure the server responds properly
     const response = await makeHttpsRequest(loginUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'OpenRPC-MCP-Server'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': baseUrl,
+        'Referer': `${baseUrl}/admin/login/`,
+        'Cache-Control': 'max-age=0',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'Content-Length': formData.toString().length.toString(),
+        'Connection': 'keep-alive'
       }
     }, formData.toString());
 
     console.error(`Auth response status: ${response.statusCode}`);
     
-    // Extract cookies from Set-Cookie headers
+    // Debug: Show all headers in different formats
+    console.error("=== Headers Debug ===");
+    console.error("Standard headers object:", JSON.stringify(response.headers, null, 2));
+    
+    if (response.rawHeaders) {
+      console.error("Raw headers array (pairs):");
+      for (let i = 0; i < response.rawHeaders.length; i += 2) {
+        console.error(`  ${response.rawHeaders[i]}: ${response.rawHeaders[i + 1]}`);
+      }
+    }
+    
+    // Extract cookies from Set-Cookie headers using multiple methods
     const setCookieHeaders: string[] = [];
-    if (response.headers['set-cookie']) {
-      // Node.js https module properly returns Set-Cookie as an array
+    
+    // Method 1: Try standard headers object
+    if (response.headers && response.headers['set-cookie']) {
+      console.error("Found cookies in headers['set-cookie']");
       setCookieHeaders.push(...(Array.isArray(response.headers['set-cookie']) 
         ? response.headers['set-cookie'] 
         : [response.headers['set-cookie']]));
     }
     
-    console.error(`Found ${setCookieHeaders.length} Set-Cookie headers`);
+    // Method 2: Parse from rawHeaders array (pairs of name, value)
+    if (setCookieHeaders.length === 0 && response.rawHeaders) {
+      for (let i = 0; i < response.rawHeaders.length; i += 2) {
+        if (response.rawHeaders[i].toLowerCase() === 'set-cookie') {
+          console.error(`Found cookie in rawHeaders at index ${i}: ${response.rawHeaders[i + 1]}`);
+          setCookieHeaders.push(response.rawHeaders[i + 1]);
+        }
+      }
+    }
+    
+    // Method 3: Try headersDistinct (Node.js 18+)
+    if (setCookieHeaders.length === 0 && response.headersDistinct) {
+      if (response.headersDistinct['set-cookie']) {
+        console.error("Found cookies in headersDistinct");
+        setCookieHeaders.push(...response.headersDistinct['set-cookie']);
+      }
+    }
+    
+    console.error(`=== Total Set-Cookie headers found: ${setCookieHeaders.length} ===`);
     if (setCookieHeaders.length > 0) {
-      console.error("Set-Cookie headers:", setCookieHeaders);
+      console.error("Set-Cookie values:", setCookieHeaders);
+    } else {
+      console.error("NO SET-COOKIE HEADERS FOUND!");
+      console.error("Response body snippet:", response.data ? response.data.substring(0, 200) : "empty");
     }
     
     const cookies = parseSetCookies(setCookieHeaders);
