@@ -170,16 +170,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "rpc_method_details",
-        description: "Get detailed information about a specific JSON-RPC method including parameters and schemas.",
+        description: "Get detailed information about specific JSON-RPC methods including parameters and schemas. Note: Method details can be very long, so only fetch details for methods you actually need to use.",
         inputSchema: {
           type: "object",
           properties: {
-            method: {
-              type: "string",
-              description: "The name of the JSON-RPC method to get details for"
+            methods: {
+              type: "array",
+              items: {
+                type: "string"
+              },
+              description: "Array of JSON-RPC method names to get details for"
             }
           },
-          required: ["method"]
+          required: ["methods"]
         }
       },
       {
@@ -230,31 +233,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "rpc_method_details": {
-      const methodName = String(request.params.arguments?.method);
-      if (!methodName) {
-        throw new Error("Method name is required");
+      const requestedMethods = request.params.arguments?.methods;
+      if (!requestedMethods || !Array.isArray(requestedMethods)) {
+        throw new Error("Methods array is required");
       }
 
-      const methods = openRpcSpec.methods || [];
-      const method = methods.find((m: any) => m.name === methodName);
-
-      if (!method) {
-        throw new Error(`Method '${methodName}' not found in OpenRPC spec`);
+      if (requestedMethods.length === 0) {
+        throw new Error("At least one method name must be provided");
       }
 
-      // Return the complete method information with all schemas resolved
-      const methodDetails = {
-        name: method.name,
-        summary: method.summary,
-        description: method.description,
-        params: method.params || [],
-        result: method.result,
-        examples: method.examples || []
+      const availableMethods = openRpcSpec.methods || [];
+      const methodDetailsList: any[] = [];
+      const notFoundMethods: string[] = [];
+
+      // Process each requested method
+      for (const methodName of requestedMethods) {
+        const method = availableMethods.find((m: any) => m.name === methodName);
+        
+        if (!method) {
+          notFoundMethods.push(methodName);
+          continue;
+        }
+
+        // Add the complete method information with all schemas resolved
+        methodDetailsList.push({
+          name: method.name,
+          summary: method.summary,
+          description: method.description,
+          params: method.params || [],
+          result: method.result,
+          examples: method.examples || []
+        });
+      }
+
+      // Prepare the response
+      const response: any = {
+        methods: methodDetailsList
       };
+
+      // Add warning about methods that weren't found
+      if (notFoundMethods.length > 0) {
+        response.notFound = notFoundMethods;
+        response.warning = `The following methods were not found in the OpenRPC spec: ${notFoundMethods.join(', ')}`;
+      }
 
       return {
         content: [
-          { type: "text", text: JSON.stringify(methodDetails, null, 2) }
+          { type: "text", text: JSON.stringify(response, null, 2) }
         ],
         isError: false
       };
