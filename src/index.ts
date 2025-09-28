@@ -86,6 +86,49 @@ function buildCookieHeader(cookies: { [key: string]: string }): string {
 }
 
 /**
+ * Make HTTPS request using Node.js native module for better cookie handling
+ */
+function makeHttpsRequest(url: string, options: any, postData?: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const urlParts = new URL(url);
+    const requestOptions = {
+      hostname: urlParts.hostname,
+      port: urlParts.port || 443,
+      path: urlParts.pathname + urlParts.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      rejectUnauthorized: false // Equivalent to curl -k
+    };
+
+    const req = https.request(requestOptions, (res) => {
+      let data = '';
+      
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      res.on('end', () => {
+        resolve({
+          statusCode: res.statusCode,
+          headers: res.headers,
+          data
+        });
+      });
+    });
+    
+    req.on('error', (error) => {
+      reject(error);
+    });
+    
+    if (postData) {
+      req.write(postData);
+    }
+    
+    req.end();
+  });
+}
+
+/**
  * Authenticate with Kerio Control and store session cookies
  */
 async function authenticateKerio(): Promise<void> {
@@ -108,25 +151,35 @@ async function authenticateKerio(): Promise<void> {
   formData.append('kerio_password', kerioCredentials.password);
 
   try {
-    const response = await fetch(loginUrl, {
+    console.error(`Authenticating with Kerio at: ${loginUrl}`);
+    
+    // Use native HTTPS module for better cookie handling
+    const response = await makeHttpsRequest(loginUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'User-Agent': 'OpenRPC-MCP-Server'
-      },
-      body: formData.toString(),
-      redirect: 'manual', // Handle redirects manually to capture cookies
-      agent: loginUrl.startsWith('https') ? httpsAgent : undefined
-    } as any);
+      }
+    }, formData.toString());
 
+    console.error(`Auth response status: ${response.statusCode}`);
+    
     // Extract cookies from Set-Cookie headers
     const setCookieHeaders: string[] = [];
-    response.headers.forEach((value, name) => {
-      if (name.toLowerCase() === 'set-cookie') {
-        setCookieHeaders.push(value);
-      }
-    });
+    if (response.headers['set-cookie']) {
+      // Node.js https module properly returns Set-Cookie as an array
+      setCookieHeaders.push(...(Array.isArray(response.headers['set-cookie']) 
+        ? response.headers['set-cookie'] 
+        : [response.headers['set-cookie']]));
+    }
+    
+    console.error(`Found ${setCookieHeaders.length} Set-Cookie headers`);
+    if (setCookieHeaders.length > 0) {
+      console.error("Set-Cookie headers:", setCookieHeaders);
+    }
+    
     const cookies = parseSetCookies(setCookieHeaders);
+    console.error("Parsed cookies:", Object.keys(cookies));
 
     if (cookies.SESSION_CONTROL_WEBADMIN && cookies.TOKEN_CONTROL_WEBADMIN) {
       kerioSession = {
@@ -134,7 +187,10 @@ async function authenticateKerio(): Promise<void> {
         tokenCookie: cookies.TOKEN_CONTROL_WEBADMIN
       };
       console.error("Kerio authentication successful");
+      console.error(`Session cookie: ${kerioSession.sessionCookie.substring(0, 10)}...`);
+      console.error(`Token cookie: ${kerioSession.tokenCookie.substring(0, 10)}...`);
     } else {
+      console.error("Required cookies not found. Available cookies:", cookies);
       throw new Error("Authentication failed - required cookies not received");
     }
 
