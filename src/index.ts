@@ -23,6 +23,7 @@ import {
 
 // Global variables to store the loaded and dereferenced OpenRPC spec and auth data
 let openRpcSpec: any = null;
+let organizedMethods: { [category: string]: any[] } = {};
 let kerioCredentials: { username: string; password: string } | null = null;
 let kerioSession: { sessionCookie: string; tokenCookie: string } | null = null;
 
@@ -43,9 +44,159 @@ async function loadOpenRpcSpec(specPath: string): Promise<void> {
     openRpcSpec = await $RefParser.dereference(rawSpec);
 
     console.error(`Loaded OpenRPC spec: ${openRpcSpec.info?.title || 'Unknown'} v${openRpcSpec.info?.version || 'Unknown'}`);
+
+    // Organize methods by category
+    organizeMethodsByCategory();
   } catch (error) {
     console.error(`Failed to load OpenRPC spec from ${specPath}:`, error);
     process.exit(1);
+  }
+}
+
+/**
+ * Organize methods by their category (first part before the dot)
+ */
+function organizeMethodsByCategory(): void {
+  if (!openRpcSpec?.methods) {
+    console.error('No methods found in OpenRPC spec');
+    return;
+  }
+
+  organizedMethods = {};
+  const methods = openRpcSpec.methods;
+
+  methods.forEach((method: any) => {
+    if (method.name && method.name.includes('.')) {
+      const [category, methodName] = method.name.split('.', 2);
+
+      if (!organizedMethods[category]) {
+        organizedMethods[category] = [];
+      }
+
+      organizedMethods[category].push({
+        name: method.name,
+        methodName: methodName,
+        summary: method.summary || method.description || "No summary available",
+        fullMethod: method
+      });
+    }
+  });
+
+  const categoryCount = Object.keys(organizedMethods).length;
+  const totalMethods = methods.length;
+  console.error(`Organized ${totalMethods} methods into ${categoryCount} categories`);
+}
+
+/**
+ * Execute a single RPC call
+ */
+async function executeSingleRpcCall(methodName: string, params: any): Promise<{ success: boolean; result?: any; error?: string }> {
+  try {
+    // Verify the method exists in the spec
+    const methods = openRpcSpec.methods || [];
+    const methodSpec = methods.find((m: any) => m.name === methodName);
+
+    if (!methodSpec) {
+      return { success: false, error: `Method '${methodName}' not found in OpenRPC spec` };
+    }
+
+    // Authenticate if Kerio credentials are provided and we don't have a session
+    if (kerioCredentials && !kerioSession) {
+      await authenticateKerio();
+    }
+
+    // Make the actual JSON-RPC call
+    const serverUrl = getServerUrl();
+
+    // Prepare transport and client based on whether we have Kerio session
+    let transport: HTTPTransport;
+    let client: Client;
+
+    if (kerioSession) {
+      // Authenticated request to Kerio Control
+      const cookieHeader = buildCookieHeader({
+        'SESSION_CONTROL_WEBADMIN': kerioSession.sessionCookie,
+        'TOKEN_CONTROL_WEBADMIN': kerioSession.tokenCookie
+      });
+
+      const headers: Record<string, string> = {
+        'Cookie': cookieHeader,
+        'X-Token': kerioSession.tokenCookie,
+        'Accept': 'application/json-rpc',
+        'X-Requested-With': 'XMLHttpRequest'
+      };
+
+      // Use the server URL as-is - it should already point to the JSON-RPC endpoint
+      // If it doesn't contain the JSON-RPC path, append it
+      let jsonRpcUrl = serverUrl;
+      if (!serverUrl.includes('/admin/api/jsonrpc')) {
+        jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
+      }
+
+      // Configure fetch options with HTTPS agent to ignore certificate errors
+      const transportOptions: any = {
+        headers,
+        agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
+      };
+      transport = new HTTPTransport(jsonRpcUrl, transportOptions);
+      client = new Client(new RequestManager([transport]));
+    } else {
+      // No authentication needed - use original implementation
+      const transportOptions: any = serverUrl.startsWith('https') ? { agent: httpsAgent } : {};
+      transport = new HTTPTransport(serverUrl, transportOptions);
+      client = new Client(new RequestManager([transport]));
+    }
+
+    const result = await client.request({ method: methodName, params: params as any });
+    return { success: true, result };
+  } catch (error) {
+    // If we have Kerio credentials and the error might be auth-related, try re-authenticating
+    if (kerioCredentials && kerioSession && (
+      error?.toString().includes('401') ||
+      error?.toString().includes('403') ||
+      error?.toString().includes('Unauthorized') ||
+      error?.toString().includes('Forbidden') ||
+      error?.toString().includes('Session expired')
+    )) {
+      console.error("Authentication may have expired, attempting to re-authenticate...");
+
+      try {
+        // Clear the existing session and re-authenticate
+        kerioSession = null;
+        await authenticateKerio();
+
+        // Retry the request with fresh authentication
+        const serverUrl = getServerUrl();
+        const retryHeaders: Record<string, string> = {
+          'Cookie': buildCookieHeader({
+            'SESSION_CONTROL_WEBADMIN': kerioSession!.sessionCookie,
+            'TOKEN_CONTROL_WEBADMIN': kerioSession!.tokenCookie
+          }),
+          'X-Token': kerioSession!.tokenCookie,
+          'Accept': 'application/json-rpc',
+          'X-Requested-With': 'XMLHttpRequest'
+        };
+
+        // Use the server URL as-is - it should already point to the JSON-RPC endpoint
+        let jsonRpcUrl = serverUrl;
+        if (!serverUrl.includes('/admin/api/jsonrpc')) {
+          jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
+        }
+        const retryTransportOptions: any = {
+          headers: retryHeaders,
+          agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
+        };
+        const retryTransport = new HTTPTransport(jsonRpcUrl, retryTransportOptions);
+        const retryClient = new Client(new RequestManager([retryTransport]));
+
+        const retryResult = await retryClient.request({ method: methodName, params: params as any });
+        return { success: true, result: retryResult };
+      } catch (retryError) {
+        return { success: false, error: `Error calling method '${methodName}' after re-authentication: ${retryError}` };
+      }
+    }
+
+    return { success: false, error: `Error calling method '${methodName}': ${error}` };
   }
 }
 
@@ -258,7 +409,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "rpc_discover",
-        description: "Discover all available JSON-RPC methods from the loaded OpenRPC spec briefly. Returns method names and summaries. Important: You must use rpc_method_details to get details on any relevant methods before calling them.",
+        description: "Discover all available JSON-RPC methods from the loaded OpenRPC spec organized by categories. Returns methods grouped by category (e.g., Session, Users, etc.) with method names and summaries. Important: You must use rpc_method_details to get details on any relevant methods before calling them.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -267,7 +418,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "rpc_method_details",
-        description: "Get detailed information about specific JSON-RPC methods including parameters and schemas. Important: This MUST be used to get the method call details before calling any method using rpc_call. Note: Method details can be very long, so only fetch details for methods you actually need to use.",
+        description: "Get detailed information about specific JSON-RPC methods including parameters and schemas. Supports both individual method names (e.g., 'Session.login') and category names (e.g., 'Session' to get all Session methods). Important: This MUST be used to get the method call details before calling any method using rpc_call. Note: Method details can be very long, so only fetch details for methods you actually need to use.",
         inputSchema: {
           type: "object",
           properties: {
@@ -276,7 +427,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: {
                 type: "string"
               },
-              description: "Array of JSON-RPC method names to get details for"
+              description: "Array of JSON-RPC method names (e.g., 'Session.login') or category names (e.g., 'Session') to get details for"
             }
           },
           required: ["methods"]
@@ -284,20 +435,41 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "rpc_call",
-        description: "Call a JSON-RPC method using the loaded OpenRPC spec. Parameters should be provided as a JSON object. Important: For any Create, Update, or Delete operations, use the Batch.run method to execute multiple methods in a batch. Before using this tool with Batch.run, first use rpc_method_details to get the method details for: 1) The Batch.run method itself to understand its structure, 2) The methods you want to include in the batch (Create/Update/Delete operations), and 3) Session.getconfigTimestamp which should be included as the final method in the batch. The Batch.run will return a timestamp that should then be used with Session.Confirm (passing the timestamp as clientTimestampList) to verify the changes.",
+        description: "Call one or more JSON-RPC methods using the loaded OpenRPC spec. Supports both single method calls and parallel execution of multiple methods. Parameters should be provided as JSON objects. Important: For any Create, Update, or Delete operations, use the Batch.run method to execute multiple methods in a batch. Before using this tool with Batch.run, first use rpc_method_details to get the method details for: 1) The Batch.run method itself to understand its structure, 2) The methods you want to include in the batch (Create/Update/Delete operations), and 3) Session.getconfigTimestamp which should be included as the final method in the batch. The Batch.run will return a timestamp that should then be used with Session.Confirm (passing the timestamp as clientTimestampList) to verify the changes.",
         inputSchema: {
           type: "object",
           properties: {
             method: {
               type: "string",
-              description: "JSON-RPC method name to call"
+              description: "JSON-RPC method name to call (for single method calls)"
             },
             params: {
               type: "string",
-              description: "JSON stringified parameters to pass to the method"
+              description: "JSON stringified parameters to pass to the method (for single method calls)"
+            },
+            calls: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  method: {
+                    type: "string",
+                    description: "JSON-RPC method name"
+                  },
+                  params: {
+                    type: "string",
+                    description: "JSON stringified parameters for this method"
+                  }
+                },
+                required: ["method"]
+              },
+              description: "Array of method calls to execute in parallel (alternative to single method call)"
             }
           },
-          required: ["method"]
+          oneOf: [
+            { required: ["method"] },
+            { required: ["calls"] }
+          ]
         }
       }
     ]
@@ -315,15 +487,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (request.params.name) {
     case "rpc_discover": {
-      const methods = openRpcSpec.methods || [];
-      const methodSummaries = methods.map((method: any) => ({
-        name: method.name,
-        summary: method.summary || method.description || "No summary available"
-      }));
+      // Return methods organized by category
+      const categorizedMethods: { [category: string]: { name: string; methodName: string; summary: string }[] } = {};
+
+      Object.keys(organizedMethods).forEach(category => {
+        categorizedMethods[category] = organizedMethods[category].map(method => ({
+          name: method.name,
+          methodName: method.methodName,
+          summary: method.summary
+        }));
+      });
+
+      const response = {
+        categories: categorizedMethods,
+        totalCategories: Object.keys(categorizedMethods).length,
+        totalMethods: Object.values(categorizedMethods).reduce((sum, methods) => sum + methods.length, 0)
+      };
 
       return {
         content: [
-          { type: "text", text: JSON.stringify(methodSummaries, null, 2) }
+          { type: "text", text: JSON.stringify(response, null, 2) }
         ],
         isError: false
       };
@@ -343,35 +526,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const methodDetailsList: any[] = [];
       const notFoundMethods: string[] = [];
 
-      // Process each requested method
-      for (const methodName of requestedMethods) {
-        const method = availableMethods.find((m: any) => m.name === methodName);
-        
-        if (!method) {
-          notFoundMethods.push(methodName);
-          continue;
-        }
+      // Process each requested method or category
+      for (const methodOrCategory of requestedMethods) {
+        // Check if this is a category name (no dot)
+        if (!methodOrCategory.includes('.')) {
+          // This is a category - add all methods from this category
+          if (organizedMethods[methodOrCategory]) {
+            organizedMethods[methodOrCategory].forEach(methodInfo => {
+              methodDetailsList.push({
+                name: methodInfo.fullMethod.name,
+                summary: methodInfo.fullMethod.summary,
+                description: methodInfo.fullMethod.description,
+                params: methodInfo.fullMethod.params || [],
+                result: methodInfo.fullMethod.result,
+                examples: methodInfo.fullMethod.examples || [],
+                category: methodOrCategory
+              });
+            });
+          } else {
+            notFoundMethods.push(methodOrCategory);
+          }
+        } else {
+          // This is a specific method name
+          const method = availableMethods.find((m: any) => m.name === methodOrCategory);
 
-        // Add the complete method information with all schemas resolved
-        methodDetailsList.push({
-          name: method.name,
-          summary: method.summary,
-          description: method.description,
-          params: method.params || [],
-          result: method.result,
-          examples: method.examples || []
-        });
+          if (!method) {
+            notFoundMethods.push(methodOrCategory);
+            continue;
+          }
+
+          // Extract category from method name
+          const [category] = methodOrCategory.split('.', 2);
+
+          // Add the complete method information with all schemas resolved
+          methodDetailsList.push({
+            name: method.name,
+            summary: method.summary,
+            description: method.description,
+            params: method.params || [],
+            result: method.result,
+            examples: method.examples || [],
+            category: category
+          });
+        }
       }
+
+      // Group methods by category for organized response
+      const categorizedResponse: { [category: string]: any[] } = {};
+      methodDetailsList.forEach(method => {
+        if (!categorizedResponse[method.category]) {
+          categorizedResponse[method.category] = [];
+        }
+        categorizedResponse[method.category].push(method);
+      });
 
       // Prepare the response
       const response: any = {
-        methods: methodDetailsList
+        categories: categorizedResponse,
+        totalMethods: methodDetailsList.length
       };
 
-      // Add warning about methods that weren't found
+      // Add warning about methods/categories that weren't found
       if (notFoundMethods.length > 0) {
         response.notFound = notFoundMethods;
-        response.warning = `The following methods were not found in the OpenRPC spec: ${notFoundMethods.join(', ')}`;
+        response.warning = `The following methods or categories were not found in the OpenRPC spec: ${notFoundMethods.join(', ')}`;
       }
 
       return {
@@ -383,140 +601,94 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "rpc_call": {
-      const methodName = String(request.params.arguments?.method);
-      const paramsRaw = request.params.arguments?.params;
-      const params = paramsRaw != null ? JSON.parse(String(paramsRaw)) : undefined;
+      // Check for parallel calls first
+      const callsArray = request.params.arguments?.calls;
 
-      if (!methodName) {
-        throw new Error("Method name is required");
-      }
-
-      // Verify the method exists in the spec
-      const methods = openRpcSpec.methods || [];
-      const methodSpec = methods.find((m: any) => m.name === methodName);
-
-      if (!methodSpec) {
-        throw new Error(`Method '${methodName}' not found in OpenRPC spec`);
-      }
-
-      // Authenticate if Kerio credentials are provided and we don't have a session
-      if (kerioCredentials && !kerioSession) {
-        await authenticateKerio();
-      }
-
-      // Make the actual JSON-RPC call
-      const serverUrl = getServerUrl();
-
-      // Prepare transport and client based on whether we have Kerio session
-      let transport: HTTPTransport;
-      let client: Client;
-      let results: any;
-
-      if (kerioSession) {
-        // Authenticated request to Kerio Control
-        const cookieHeader = buildCookieHeader({
-          'SESSION_CONTROL_WEBADMIN': kerioSession.sessionCookie,
-          'TOKEN_CONTROL_WEBADMIN': kerioSession.tokenCookie
-        });
-
-        const headers: Record<string, string> = {
-          'Cookie': cookieHeader,
-          'X-Token': kerioSession.tokenCookie,
-          'Accept': 'application/json-rpc',
-          'X-Requested-With': 'XMLHttpRequest'
-        };
-
-        // Use the server URL as-is - it should already point to the JSON-RPC endpoint
-        // If it doesn't contain the JSON-RPC path, append it
-        let jsonRpcUrl = serverUrl;
-        if (!serverUrl.includes('/admin/api/jsonrpc')) {
-          jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
+      if (callsArray && Array.isArray(callsArray)) {
+        // Parallel calls mode
+        if (callsArray.length === 0) {
+          throw new Error("At least one call must be provided in calls array");
         }
-        
-        // Configure fetch options with HTTPS agent to ignore certificate errors
-        const transportOptions: any = { 
-          headers,
-          agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
-        };
-        transport = new HTTPTransport(jsonRpcUrl, transportOptions);
-        client = new Client(new RequestManager([transport]));
-      } else {
-        // No authentication needed - use original implementation
-        const transportOptions: any = serverUrl.startsWith('https') ? { agent: httpsAgent } : {};
-        transport = new HTTPTransport(serverUrl, transportOptions);
-        client = new Client(new RequestManager([transport]));
-      }
 
-      try {
-        results = await client.request({ method: methodName, params: params as any });
-        return {
-          content: [
-            { type: "text", text: JSON.stringify(results, null, 2) }
-          ],
-          isError: false
-        };
-      } catch (error) {
-        // If we have Kerio credentials and the error might be auth-related, try re-authenticating
-        if (kerioCredentials && kerioSession && (
-          error?.toString().includes('401') ||
-          error?.toString().includes('403') ||
-          error?.toString().includes('Unauthorized') ||
-          error?.toString().includes('Forbidden') ||
-          error?.toString().includes('Session expired')
-        )) {
-          console.error("Authentication may have expired, attempting to re-authenticate...");
-
-          try {
-            // Clear the existing session and re-authenticate
-            kerioSession = null;
-            await authenticateKerio();
-
-            // Retry the request with fresh authentication
-            const retryHeaders: Record<string, string> = {
-              'Cookie': buildCookieHeader({
-                'SESSION_CONTROL_WEBADMIN': kerioSession!.sessionCookie,
-                'TOKEN_CONTROL_WEBADMIN': kerioSession!.tokenCookie
-              }),
-              'X-Token': kerioSession!.tokenCookie,
-              'Accept': 'application/json-rpc',
-              'X-Requested-With': 'XMLHttpRequest'
-            };
-
-            // Use the server URL as-is - it should already point to the JSON-RPC endpoint
-            let jsonRpcUrl = serverUrl;
-            if (!serverUrl.includes('/admin/api/jsonrpc')) {
-              jsonRpcUrl = `${serverUrl}/admin/api/jsonrpc/`;
-            }
-            const retryTransportOptions: any = {
-              headers: retryHeaders,
-              agent: jsonRpcUrl.startsWith('https') ? httpsAgent : undefined
-            };
-            const retryTransport = new HTTPTransport(jsonRpcUrl, retryTransportOptions);
-            const retryClient = new Client(new RequestManager([retryTransport]));
-
-            const retryResults = await retryClient.request({ method: methodName, params: params as any });
-            return {
-              content: [
-                { type: "text", text: JSON.stringify(retryResults, null, 2) }
-              ],
-              isError: false
-            };
-          } catch (retryError) {
-            return {
-              content: [
-                { type: "text", text: `Error calling method '${methodName}' after re-authentication: ${retryError}` }
-              ],
-              isError: true
-            };
+        // Validate each call
+        for (const call of callsArray) {
+          if (!call.method) {
+            throw new Error("Each call must have a 'method' property");
           }
         }
 
-        return {
-          content: [
-            { type: "text", text: `Error calling method '${methodName}': ${error}` }
-          ],
-          isError: true
-        };
+        // Execute all calls in parallel
+        const callPromises = callsArray.map(async (call: any, index: number) => {
+          const params = call.params ? JSON.parse(String(call.params)) : undefined;
+          const result = await executeSingleRpcCall(call.method, params);
+          return {
+            index,
+            method: call.method,
+            ...result
+          };
+        });
+
+        try {
+          const results = await Promise.all(callPromises);
+
+          // Separate successful and failed calls
+          const successfulCalls = results.filter(r => r.success);
+          const failedCalls = results.filter(r => !r.success);
+
+          const response: any = {
+            totalCalls: callsArray.length,
+            successfulCalls: successfulCalls.length,
+            failedCalls: failedCalls.length,
+            results: results.map(r => ({
+              index: r.index,
+              method: r.method,
+              success: r.success,
+              result: r.result,
+              error: r.error
+            }))
+          };
+
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(response, null, 2) }
+            ],
+            isError: failedCalls.length > 0
+          };
+        } catch (error) {
+          return {
+            content: [
+              { type: "text", text: `Error executing parallel calls: ${error}` }
+            ],
+            isError: true
+          };
+        }
+      } else {
+        // Single call mode (backward compatibility)
+        const methodName = String(request.params.arguments?.method);
+        const paramsRaw = request.params.arguments?.params;
+        const params = paramsRaw != null ? JSON.parse(String(paramsRaw)) : undefined;
+
+        if (!methodName) {
+          throw new Error("Method name is required");
+        }
+
+        const result = await executeSingleRpcCall(methodName, params);
+
+        if (result.success) {
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(result.result, null, 2) }
+            ],
+            isError: false
+          };
+        } else {
+          return {
+            content: [
+              { type: "text", text: result.error || "Unknown error occurred" }
+            ],
+            isError: true
+          };
+        }
       }
     }
 
