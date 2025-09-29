@@ -461,7 +461,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           error?.toString().includes('401') ||
           error?.toString().includes('403') ||
           error?.toString().includes('Unauthorized') ||
-          error?.toString().includes('Forbidden')
+          error?.toString().includes('Forbidden') ||
+          error?.toString().includes('Session expired')
         )) {
           console.error("Authentication may have expired, attempting to re-authenticate...");
 
