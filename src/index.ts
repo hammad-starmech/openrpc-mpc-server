@@ -258,7 +258,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "rpc_discover",
-        description: "Discover available JSON-RPC methods from the loaded OpenRPC spec. Returns method names and summaries.",
+        description: "Discover all available JSON-RPC methods from the loaded OpenRPC spec briefly. Returns method names and summaries. Important: You must use rpc_method_details to get details on any relevant methods before calling them.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -267,7 +267,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "rpc_method_details",
-        description: "Get detailed information about specific JSON-RPC methods including parameters and schemas. Note: Method details can be very long, so only fetch details for methods you actually need to use.",
+        description: "Get detailed information about specific JSON-RPC methods including parameters and schemas. Important: This MUST be used to get the method call details before calling any method using rpc_call. Note: Method details can be very long, so only fetch details for methods you actually need to use.",
         inputSchema: {
           type: "object",
           properties: {
